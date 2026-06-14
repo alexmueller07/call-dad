@@ -16,7 +16,7 @@ export default async function LoginPage({
       <div className="w-full max-w-sm rounded-3xl border border-border bg-card p-8 shadow-xl shadow-black/5">
         <div className="mb-7 text-center">
           <div className="mb-2 text-4xl">📞</div>
-          <h1 className="text-2xl font-bold tracking-tight">CallMom</h1>
+          <h1 className="text-2xl font-bold tracking-tight">CallDad</h1>
           <p className="mt-1 text-sm text-muted">
             Cheap calls to the people back home.
           </p>

@@ -13,9 +13,12 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "CallMom — cheap calls home",
+  title: "CallDad — cheap calls home",
   description: "Call family on any phone, cheaply, straight from your browser.",
 };
+
+// Set the theme class before first paint to avoid a flash of the wrong theme.
+const themeBoot = `(function(){try{var t=localStorage.getItem('theme')||'system';var d=t==='dark'||(t==='system'&&matchMedia('(prefers-color-scheme: dark)').matches);document.documentElement.classList.toggle('dark',d);}catch(e){}})();`;
 
 export default function RootLayout({
   children,
@@ -27,7 +30,10 @@ export default function RootLayout({
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-screen">{children}</body>
+      <body className="min-h-screen">
+        <script dangerouslySetInnerHTML={{ __html: themeBoot }} />
+        {children}
+      </body>
     </html>
   );
 }

@@ -1,14 +1,28 @@
 @import "tailwindcss";
 
+/* Class-based dark mode so the Settings toggle can override the OS preference. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
-  --background: #e9ebef;
+  --background: #f3f4f8;
   --foreground: #0b0c0f;
   --card: #ffffff;
   --screen: #f3f4f8;
   --border: #e2e5ea;
   --muted: #8a8f98;
-  --accent: #16a34a; /* call green */
+  --accent: #16a34a;
   --tabbar: rgba(255, 255, 255, 0.82);
+}
+
+.dark {
+  --background: #0a0b0d;
+  --foreground: #f5f5f7;
+  --card: #17181b;
+  --screen: #0b0b0d;
+  --border: #2a2a2e;
+  --muted: #8a8f98;
+  --accent: #2fd968;
+  --tabbar: rgba(20, 20, 22, 0.82);
 }
 
 @theme inline {
@@ -22,19 +36,6 @@
   --color-tabbar: var(--tabbar);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #000000;
-    --foreground: #f5f5f7;
-    --card: #1c1c1e;
-    --screen: #0b0b0d;
-    --border: #2a2a2e;
-    --muted: #8a8f98;
-    --accent: #30d158;
-    --tabbar: rgba(22, 22, 24, 0.82);
-  }
 }
 
 body {
@@ -55,16 +56,34 @@ body {
   70% { box-shadow: 0 0 0 24px transparent; }
   100% { box-shadow: 0 0 0 0 transparent; }
 }
+@keyframes floatGlow {
+  0%, 100% { transform: translate(0, 0); opacity: 0.6; }
+  50% { transform: translate(20px, -20px); opacity: 0.9; }
+}
 
 .animate-slide-up { animation: slideUp 0.34s cubic-bezier(0.22, 1, 0.36, 1) both; }
 .animate-fade-in { animation: fadeIn 0.26s ease both; }
 .animate-pop { animation: pop 0.16s ease both; }
 .pulse-ring { animation: pulseRing 1.8s ease-out infinite; }
 
-/* Keypad / press feedback */
-.press { transition: transform 0.08s ease, background-color 0.15s ease; }
-.press:active { transform: scale(0.92); }
+.press { transition: transform 0.08s ease, background-color 0.15s ease, box-shadow 0.15s ease; }
+.press:active { transform: scale(0.94); }
 
-/* Hide scrollbars inside the phone screen for a native feel */
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* Dark green landing canvas */
+.landing-bg {
+  background:
+    radial-gradient(60rem 30rem at 15% -10%, rgba(34, 197, 94, 0.18), transparent 60%),
+    radial-gradient(50rem 30rem at 100% 10%, rgba(16, 185, 129, 0.14), transparent 55%),
+    radial-gradient(40rem 30rem at 50% 120%, rgba(34, 197, 94, 0.12), transparent 60%),
+    #05070a;
+}
+.grid-overlay {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(70% 60% at 50% 0%, #000 30%, transparent 75%);
+}
