@@ -6,6 +6,7 @@ import 'server-only';
 import { cache } from 'react';
 import { redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
+import { createAdminClient } from '@/lib/supabase/admin';
 
 export type Profile = {
   id: string;
@@ -29,16 +30,26 @@ export const requireUser = cache(async () => {
 export const getProfile = cache(async (): Promise<Profile> => {
   const user = await requireUser();
   const supabase = await createClient();
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from('profiles')
     .select('id, email, balance_seconds')
     .eq('id', user.id)
     .single();
 
-  if (error || !data) {
-    // The signup trigger creates this row; a miss means the migration or
-    // trigger hasn't run. Fail loud rather than show a wrong balance.
-    throw new Error(`Profile not found for user ${user.id}: ${error?.message}`);
+  if (data) return data;
+
+  // Self-heal: the signup trigger normally creates this row, but if it's ever
+  // missing (trigger race, manual deletion) create it rather than 500-ing the
+  // whole app. Needs the admin client since RLS gives users no insert on profiles.
+  const admin = createAdminClient();
+  const { data: created, error: createErr } = await admin
+    .from('profiles')
+    .upsert({ id: user.id, email: user.email }, { onConflict: 'id' })
+    .select('id, email, balance_seconds')
+    .single();
+
+  if (createErr || !created) {
+    throw new Error(`Could not load or create profile for ${user.id}: ${createErr?.message}`);
   }
-  return data;
+  return created;
 });
