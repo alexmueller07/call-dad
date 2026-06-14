@@ -8,6 +8,7 @@
 import twilio from 'twilio';
 import { requireTwilioConfig } from '@/lib/twilio-config';
 import { createClient } from '@/lib/supabase/server';
+import { isCallerAllowed } from '@/lib/calling';
 
 // Tokens depend on secrets + must never be cached/prerendered.
 export const dynamic = 'force-dynamic';
@@ -19,16 +20,8 @@ export async function GET() {
   } = await supabase.auth.getUser();
   if (!user) return new Response('Unauthorized', { status: 401 });
 
-  // Calling allowlist. Until the guarded "any number" dialer + per-minute
-  // billing ships, restrict who can actually place calls so a public deploy
-  // can't let strangers ring our fixed contacts on our Twilio balance. If
-  // ALLOWED_CALLER_EMAILS is empty/unset, everyone may call (dev default). No
-  // token = no call, so gating here is the single choke point.
-  const allow = (process.env.ALLOWED_CALLER_EMAILS ?? '')
-    .split(',')
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  if (allow.length > 0 && !allow.includes((user.email ?? '').toLowerCase())) {
+  // Who may PLACE calls (no token = no call, so this is the single choke point).
+  if (!isCallerAllowed(user.email)) {
     return new Response('Calling is not enabled for this account yet.', { status: 403 });
   }
 

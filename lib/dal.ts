@@ -10,7 +10,7 @@ import { createClient } from '@/lib/supabase/server';
 export type Profile = {
   id: string;
   email: string | null;
-  balance_cents: number;
+  balance_seconds: number;
 };
 
 // Returns the authenticated Supabase user or redirects to /login. Use this at
@@ -31,7 +31,7 @@ export const getProfile = cache(async (): Promise<Profile> => {
   const supabase = await createClient();
   const { data, error } = await supabase
     .from('profiles')
-    .select('id, email, balance_cents')
+    .select('id, email, balance_seconds')
     .eq('id', user.id)
     .single();
 

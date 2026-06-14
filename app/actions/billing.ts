@@ -1,50 +1,65 @@
 'use server';
 
-// TEST-ONLY top-up. Stands in for Stripe until it's wired: clicking the button
-// credits $1 to the signed-in user. It runs with the service-role (admin)
-// client because users have NO write access to their own balance by design
-// (RLS) — money only moves server-side. Gated behind ENABLE_TEST_TOPUP so it
-// can be switched off in production with one env var.
-import { revalidatePath } from 'next/cache';
+// TEST-ONLY time purchase. Stands in for Stripe until it's wired: "buying" a
+// pack instantly grants the call time. Runs with the service-role (admin)
+// client because users can't write their own balance (RLS). The server
+// recomputes minutes + price from the chosen pack so the client can't forge a
+// cheaper/bigger purchase. Gated behind ENABLE_TEST_TOPUP.
 import { requireUser } from '@/lib/dal';
 import { createAdminClient } from '@/lib/supabase/admin';
+import {
+  PACKAGES,
+  CUSTOM_MIN_MINUTES,
+  CUSTOM_MAX_MINUTES,
+  customPriceCents,
+} from '@/lib/pricing';
 
 const ENABLED = process.env.ENABLE_TEST_TOPUP === 'true';
-const STEP_CENTS = 100; // $1 per click
-const MAX_TEST_BALANCE_CENTS = 5000; // $50 cap so the test button can't mint silly balances
 
-export async function addTestCredit() {
-  if (!ENABLED) throw new Error('Test top-up is disabled.');
+export type BuyInput = { packageId?: string; customMinutes?: number };
+
+export async function buyTime(input: BuyInput): Promise<{ ok: boolean; error?: string }> {
+  if (!ENABLED) return { ok: false, error: 'Purchases are disabled.' };
+
+  let minutes: number;
+  let priceCents: number;
+
+  if (input.packageId) {
+    const pkg = PACKAGES.find((p) => p.id === input.packageId);
+    if (!pkg) return { ok: false, error: 'Unknown package.' };
+    minutes = pkg.minutes;
+    priceCents = pkg.priceCents;
+  } else {
+    const m = Math.floor(input.customMinutes ?? 0);
+    if (m < CUSTOM_MIN_MINUTES || m > CUSTOM_MAX_MINUTES) {
+      return { ok: false, error: `Custom amount must be ${CUSTOM_MIN_MINUTES}–${CUSTOM_MAX_MINUTES} minutes.` };
+    }
+    minutes = m;
+    priceCents = customPriceCents(m);
+  }
 
   const user = await requireUser();
   const admin = createAdminClient();
 
   const { data: profile, error: readErr } = await admin
     .from('profiles')
-    .select('balance_cents')
+    .select('balance_seconds')
     .eq('id', user.id)
     .single();
-  if (readErr || !profile) throw new Error(`Could not read balance: ${readErr?.message}`);
+  if (readErr) return { ok: false, error: readErr.message };
 
-  const current = profile.balance_cents as number;
-  if (current >= MAX_TEST_BALANCE_CENTS) {
-    revalidatePath('/');
-    return; // already at the test cap
-  }
+  const addSeconds = minutes * 60;
+  const next = (profile?.balance_seconds ?? 0) + addSeconds;
 
-  const next = Math.min(current + STEP_CENTS, MAX_TEST_BALANCE_CENTS);
-  const delta = next - current;
-
-  // NOTE: read-modify-write is fine for a single-user test button. Real Stripe
-  // top-ups will use an atomic DB function keyed off the webhook event id.
   const { error: updErr } = await admin
     .from('profiles')
-    .update({ balance_cents: next })
+    .update({ balance_seconds: next })
     .eq('id', user.id);
-  if (updErr) throw new Error(`Could not update balance: ${updErr.message}`);
+  if (updErr) return { ok: false, error: updErr.message };
 
-  // Mirror the audit row a real top-up will write (stripe_payment_intent null = test).
-  await admin.from('top_ups').insert({ user_id: user.id, amount_cents: delta });
+  await admin
+    .from('top_ups')
+    .insert({ user_id: user.id, amount_cents: priceCents, seconds_added: addSeconds });
 
-  revalidatePath('/');
+  return { ok: true };
 }
