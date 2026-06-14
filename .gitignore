@@ -36,6 +36,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# ephemeral working notes / test scripts
+/scratchpad
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
