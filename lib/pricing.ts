@@ -16,7 +16,7 @@ export const STANDARD_RATE_CENTS_PER_MIN = 10; // floor rate (10c/min)
 export const PACKAGES: TimePackage[] = [
   { id: 'p30', minutes: 30, priceCents: 500, label: '30 minutes', blurb: 'Quick catch-up' },
   { id: 'p60', minutes: 60, priceCents: 700, label: '1 hour', blurb: 'Most popular' },
-  { id: 'p120', minutes: 120, priceCents: 1200, label: '2 hours', blurb: 'Best value · 10¢/min' },
+  { id: 'p120', minutes: 120, priceCents: 1200, label: '2 hours', blurb: 'Best value' },
 ];
 
 // Custom purchases are for "more than the 2-hour pack", billed at the floor rate.
