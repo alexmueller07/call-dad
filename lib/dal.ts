@@ -43,6 +43,36 @@ export const getProfile = cache(async (): Promise<Profile> => {
   return data;
 });
 
+export type TopUp = { amount_cents: number; created_at: string };
+export type CallRow = {
+  to_number: string;
+  seconds: number;
+  cost_cents: number;
+  created_at: string;
+};
+
+// Recent account activity for the dashboard. RLS scopes both queries to the
+// current user automatically.
+export const getRecentActivity = cache(
+  async (): Promise<{ topups: TopUp[]; calls: CallRow[] }> => {
+    await requireUser();
+    const supabase = await createClient();
+    const [topupsRes, callsRes] = await Promise.all([
+      supabase
+        .from('top_ups')
+        .select('amount_cents, created_at')
+        .order('created_at', { ascending: false })
+        .limit(5),
+      supabase
+        .from('calls')
+        .select('to_number, seconds, cost_cents, created_at')
+        .order('created_at', { ascending: false })
+        .limit(5),
+    ]);
+    return { topups: topupsRes.data ?? [], calls: callsRes.data ?? [] };
+  },
+);
+
 // Format an integer number of cents as "$1.23" for display.
 export function formatBalance(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`;

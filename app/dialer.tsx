@@ -108,14 +108,14 @@ export function Dialer() {
   const mmss = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 
   return (
-    <div className="flex flex-col items-center gap-8">
-      <div className="flex flex-wrap justify-center gap-4">
+    <div className="flex flex-col items-center gap-5">
+      <div className="grid w-full grid-cols-2 gap-3">
         {CONTACTS.map((c) => (
           <button
             key={c.key}
             onClick={() => placeCall(c.key, c.label)}
             disabled={status !== 'ready' && status !== 'ended'}
-            className="flex min-w-32 flex-col items-center gap-1 rounded-2xl bg-green-600 px-8 py-5 text-lg font-medium text-white shadow-md transition hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-40"
+            className="flex flex-col items-center gap-1 rounded-2xl bg-accent px-6 py-5 text-lg font-semibold text-white shadow-md transition hover:brightness-110 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40"
           >
             <span className="text-3xl">{c.emoji}</span>
             Call {c.label}
@@ -123,18 +123,22 @@ export function Dialer() {
         ))}
       </div>
 
-      {status === 'connected' && <div className="font-mono text-4xl tabular-nums">{mmss}</div>}
+      {status === 'connected' && (
+        <div className="font-mono text-4xl font-bold tabular-nums text-accent">{mmss}</div>
+      )}
 
       {onCall && (
         <button
           onClick={hangUp}
-          className="rounded-full bg-red-600 px-8 py-3 text-white shadow-md transition hover:bg-red-700"
+          className="rounded-full bg-red-600 px-8 py-2.5 font-semibold text-white shadow-md transition hover:bg-red-700 active:scale-[0.99]"
         >
           Hang up
         </button>
       )}
 
-      <p className={`min-h-6 text-sm ${status === 'error' ? 'text-red-600' : 'text-gray-500'}`}>
+      <p
+        className={`min-h-5 text-sm ${status === 'error' ? 'text-red-600' : 'text-muted'}`}
+      >
         {message}
       </p>
     </div>

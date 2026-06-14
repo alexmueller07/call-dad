@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Call Home",
-  description: "Call family on any phone, free, straight from your browser.",
+  title: "CallMom — cheap calls home",
+  description: "Call family on any phone, cheaply, straight from your browser.",
 };
 
 export default function RootLayout({
