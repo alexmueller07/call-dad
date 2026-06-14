@@ -36,6 +36,17 @@ type Props = {
   testTopupEnabled: boolean;
 };
 
+const LOW_TIME_SECONDS = 120;
+
+const AVATAR_COLORS = [
+  'bg-rose-500', 'bg-orange-500', 'bg-amber-500', 'bg-emerald-500', 'bg-teal-500',
+  'bg-sky-500', 'bg-indigo-500', 'bg-violet-500', 'bg-fuchsia-500', 'bg-pink-500',
+];
+function colorFor(s: string): string {
+  let h = 0;
+  for (const c of s) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
 const initials = (name: string) =>
   name.trim().split(/\s+/).slice(0, 2).map((w) => w[0]?.toUpperCase() ?? '').join('') || '#';
 const mmss = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
@@ -43,6 +54,50 @@ const mmss = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, 
 function prettyNumber(n: string): string {
   const m = /^\+1(\d{3})(\d{3})(\d{4})$/.exec(n);
   return m ? `(${m[1]}) ${m[2]}-${m[3]}` : n;
+}
+
+// Format the in-progress dialed string for display (US-style, progressive).
+function formatDial(v: string): string {
+  if (v.startsWith('+')) return v;
+  const d = v.replace(/\D/g, '');
+  if (!d) return '';
+  if (d.length <= 3) return d;
+  if (d.length <= 6) return `(${d.slice(0, 3)}) ${d.slice(3)}`;
+  return `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6, 10)}${d.length > 10 ? ' ' + d.slice(10) : ''}`;
+}
+
+// Real DTMF tones for keypad feedback.
+const DTMF: Record<string, [number, number]> = {
+  '1': [697, 1209], '2': [697, 1336], '3': [697, 1477],
+  '4': [770, 1209], '5': [770, 1336], '6': [770, 1477],
+  '7': [852, 1209], '8': [852, 1336], '9': [852, 1477],
+  '*': [941, 1209], '0': [941, 1336], '#': [941, 1477],
+};
+function useDtmf() {
+  const ctxRef = useRef<AudioContext | null>(null);
+  return useCallback((key: string) => {
+    const pair = DTMF[key];
+    if (!pair) return;
+    try {
+      const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (!ctxRef.current) ctxRef.current = new AC();
+      const ctx = ctxRef.current;
+      const t = ctx.currentTime;
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.07, t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
+      gain.connect(ctx.destination);
+      for (const f of pair) {
+        const o = ctx.createOscillator();
+        o.frequency.value = f;
+        o.connect(gain);
+        o.start(t);
+        o.stop(t + 0.16);
+      }
+    } catch {
+      /* audio not available — ignore */
+    }
+  }, []);
 }
 
 const NAV: { key: Tab; label: string }[] = [
@@ -60,11 +115,10 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [recents, setRecents] = useState<CallRow[]>([]);
   const [keypad, setKeypad] = useState('');
-  const [showAdd, setShowAdd] = useState(false);
+  const [sheet, setSheet] = useState<{ mode: 'add' | 'edit'; contact?: Contact; prefill?: string } | null>(null);
 
   const hasTime = balanceSeconds > 0;
 
-  // ---- Twilio device ----
   const deviceRef = useRef<Device | null>(null);
   const callRef = useRef<Call | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -101,7 +155,6 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
     };
   }, [canCall]);
 
-  // ---- data ----
   const loadContacts = useCallback(async () => {
     const { data } = await supabase
       .from('contacts')
@@ -133,7 +186,6 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
     loadRecents();
   }, [loadContacts, loadRecents]);
 
-  // ---- calling ----
   const startTimer = () => {
     setSeconds(0);
     timerRef.current = setInterval(() => setSeconds((s) => s + 1), 1000);
@@ -152,12 +204,10 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
       }
       const number = normalizeNumber(rawNumber);
       if (!deviceRef.current || !isValidE164(number)) return;
-
       setCallPeer({ name: name || prettyNumber(number), number });
       setCallState('connecting');
       const call = await deviceRef.current.connect({ params: { To: number } });
       callRef.current = call;
-
       call.on('accept', () => {
         setCallState('live');
         startTimer();
@@ -182,6 +232,23 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
     deviceRef.current?.disconnectAll();
   }, []);
 
+  const saveContact = async (name: string, number: string): Promise<string | null> => {
+    if (sheet?.mode === 'edit' && sheet.contact) {
+      const { error } = await supabase
+        .from('contacts')
+        .update({ name, phone_number: number })
+        .eq('id', sheet.contact.id);
+      if (error) return error.message;
+    } else {
+      const { error } = await supabase.from('contacts').insert({ user_id: userId, name, phone_number: number });
+      if (error) return error.message;
+    }
+    setSheet(null);
+    loadContacts();
+    setTab('contacts');
+    return null;
+  };
+
   const callableNow = canCall && deviceReady && hasTime;
   const callDisabledReason = !canCall
     ? "Calling isn't enabled for your account yet."
@@ -192,10 +259,7 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
         : '';
 
   const titles: Record<Tab, string> = {
-    contacts: 'Contacts',
-    keypad: 'Keypad',
-    recents: 'Recents',
-    account: 'Account',
+    contacts: 'Contacts', keypad: 'Keypad', recents: 'Recents', account: 'Account',
   };
 
   return (
@@ -207,12 +271,12 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
           <span className="text-xl font-bold tracking-tight">CallMom</span>
         </div>
 
-        <div className="mb-6 rounded-2xl bg-gradient-to-br from-accent to-emerald-700 p-4 text-white">
+        <div className="mb-6 rounded-2xl bg-gradient-to-br from-accent to-emerald-700 p-4 text-white shadow-md shadow-emerald-900/10">
           <p className="text-xs text-white/80">Call time left</p>
           <p className="text-2xl font-bold tabular-nums">{formatDuration(balanceSeconds)}</p>
           <button
             onClick={() => setTab('account')}
-            className="press mt-2 w-full rounded-lg bg-white/15 py-1.5 text-sm font-semibold hover:bg-white/25"
+            className="press mt-2 w-full rounded-lg bg-white/15 py-1.5 text-sm font-semibold transition hover:bg-white/25"
           >
             Buy time
           </button>
@@ -225,18 +289,15 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
         </nav>
 
         <div className="mt-auto">
-          <p className="mb-2 truncate px-2 text-xs text-muted" title={email}>
-            {email}
-          </p>
+          <p className="mb-2 truncate px-2 text-xs text-muted" title={email}>{email}</p>
           <form action={signOut}>
-            <button className="press w-full rounded-xl border border-border py-2 text-sm font-semibold text-red-600 hover:bg-red-500/5">
+            <button className="press w-full rounded-xl border border-border py-2 text-sm font-semibold text-red-600 transition hover:bg-red-500/5">
               Log out
             </button>
           </form>
         </div>
       </aside>
 
-      {/* Main column */}
       <div className="flex min-h-screen flex-1 flex-col">
         {/* Mobile top bar */}
         <header className="flex items-center justify-between border-b border-border bg-card/60 px-4 py-3 backdrop-blur md:hidden">
@@ -244,22 +305,17 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
             <PhoneBadge />
             <span className="font-bold">CallMom</span>
           </div>
-          <span
-            className={`rounded-full px-2.5 py-1 text-sm font-semibold ${
-              hasTime ? 'bg-accent/10 text-accent' : 'bg-amber-500/15 text-amber-600'
-            }`}
-          >
+          <span className={`rounded-full px-2.5 py-1 text-sm font-semibold ${hasTime ? 'bg-accent/10 text-accent' : 'bg-amber-500/15 text-amber-600'}`}>
             {hasTime ? formatDuration(balanceSeconds) : 'No time'}
           </span>
         </header>
 
-        {/* Page heading (desktop) */}
         <div className="hidden items-center justify-between px-8 pt-7 md:flex">
           <h1 className="text-3xl font-bold tracking-tight">{titles[tab]}</h1>
           {tab === 'contacts' && (
             <button
-              onClick={() => setShowAdd(true)}
-              className="press flex items-center gap-2 rounded-full bg-accent px-4 py-2 font-semibold text-white shadow"
+              onClick={() => setSheet({ mode: 'add' })}
+              className="press flex items-center gap-2 rounded-full bg-accent px-4 py-2 font-semibold text-white shadow transition hover:brightness-110"
             >
               <span className="text-lg leading-none">+</span> Add contact
             </button>
@@ -271,6 +327,14 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
             Build your contacts and dialer — calling unlocks soon.
           </div>
         )}
+        {canCall && hasTime && balanceSeconds < LOW_TIME_SECONDS && (
+          <button
+            onClick={() => setTab('account')}
+            className="mx-4 mt-3 rounded-xl bg-amber-500/10 px-3 py-2 text-center text-sm font-medium text-amber-700 transition hover:bg-amber-500/20 md:mx-8 dark:text-amber-400"
+          >
+            ⏳ Running low — {formatDuration(balanceSeconds)} left. Tap to top up.
+          </button>
+        )}
 
         <main key={tab} className="flex-1 animate-fade-in overflow-y-auto px-4 pb-24 pt-4 md:px-8 md:pb-8">
           {tab === 'contacts' && (
@@ -278,11 +342,12 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
               contacts={contacts}
               canCall={callableNow}
               onCall={placeCall}
+              onEdit={(c) => setSheet({ mode: 'edit', contact: c })}
               onDelete={async (id) => {
                 await supabase.from('contacts').delete().eq('id', id);
                 loadContacts();
               }}
-              onAdd={() => setShowAdd(true)}
+              onAdd={() => setSheet({ mode: 'add' })}
             />
           )}
           {tab === 'keypad' && (
@@ -292,11 +357,17 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
               canCall={callableNow}
               disabledReason={callDisabledReason}
               onCall={() => placeCall(keypad, '')}
-              onSaveContact={() => setShowAdd(true)}
+              onSaveContact={() => setSheet({ mode: 'add', prefill: keypad })}
             />
           )}
           {tab === 'recents' && (
-            <RecentsView recents={recents} contacts={contacts} canCall={callableNow} onCall={placeCall} />
+            <RecentsView
+              recents={recents}
+              contacts={contacts}
+              canCall={callableNow}
+              onCall={placeCall}
+              onSave={(num) => setSheet({ mode: 'add', prefill: num })}
+            />
           )}
           {tab === 'account' && (
             <AccountView
@@ -308,7 +379,6 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
           )}
         </main>
 
-        {/* Mobile bottom nav */}
         <nav className="fixed inset-x-0 bottom-0 z-10 grid grid-cols-4 border-t border-border bg-tabbar px-2 py-2 backdrop-blur-xl md:hidden">
           {NAV.map((it) => {
             const active = tab === it.key;
@@ -330,20 +400,13 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
         <CallOverlay peer={callPeer} state={callState} seconds={seconds} onHangUp={hangUp} />
       )}
 
-      {showAdd && (
-        <AddContactSheet
-          prefill={tab === 'keypad' ? keypad : ''}
-          onClose={() => setShowAdd(false)}
-          onSave={async (name, number) => {
-            const { error } = await supabase
-              .from('contacts')
-              .insert({ user_id: userId, name, phone_number: number });
-            if (error) return error.message;
-            setShowAdd(false);
-            loadContacts();
-            setTab('contacts');
-            return null;
-          }}
+      {sheet && (
+        <ContactSheet
+          mode={sheet.mode}
+          initial={sheet.contact}
+          prefill={sheet.prefill}
+          onClose={() => setSheet(null)}
+          onSave={saveContact}
         />
       )}
     </div>
@@ -367,18 +430,17 @@ function NavButton({ item, active, onClick }: { item: { key: Tab; label: string 
 
 /* ----------------------------- Contacts ----------------------------- */
 function ContactsView({
-  contacts,
-  canCall,
-  onCall,
-  onDelete,
-  onAdd,
+  contacts, canCall, onCall, onEdit, onDelete, onAdd,
 }: {
   contacts: Contact[];
   canCall: boolean;
   onCall: (n: string, name: string) => void;
+  onEdit: (c: Contact) => void;
   onDelete: (id: string) => void;
   onAdd: () => void;
 }) {
+  const [q, setQ] = useState('');
+
   if (contacts.length === 0) {
     return (
       <EmptyState
@@ -389,46 +451,67 @@ function ContactsView({
       />
     );
   }
+
+  const filtered = contacts.filter(
+    (c) => c.name.toLowerCase().includes(q.toLowerCase()) || c.phone_number.includes(q.replace(/\D/g, '')),
+  );
+
   return (
-    <ul className="mx-auto grid w-full max-w-4xl gap-3 sm:grid-cols-2 lg:grid-cols-3">
-      {contacts.map((c) => (
-        <li
-          key={c.id}
-          className="group flex items-center gap-3 rounded-2xl border border-border bg-card p-4 shadow-sm transition hover:shadow-md"
-        >
-          <Avatar text={initials(c.name)} />
-          <button onClick={() => canCall && onCall(c.phone_number, c.name)} className="min-w-0 flex-1 text-left">
-            <p className="truncate font-semibold">{c.name}</p>
-            <p className="truncate text-sm text-muted">{prettyNumber(c.phone_number)}</p>
-          </button>
-          <button
-            onClick={() => onCall(c.phone_number, c.name)}
-            aria-label={`Call ${c.name}`}
-            className="press grid h-10 w-10 place-items-center rounded-full bg-accent/10 text-accent"
-          >
-            <PhoneIcon className="h-5 w-5" />
-          </button>
-          <button
-            onClick={() => onDelete(c.id)}
-            aria-label={`Delete ${c.name}`}
-            className="press grid h-9 w-9 place-items-center rounded-full text-muted opacity-0 transition group-hover:opacity-100"
-          >
-            ✕
-          </button>
-        </li>
-      ))}
-    </ul>
+    <div className="mx-auto w-full max-w-4xl">
+      <input
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+        placeholder="Search contacts"
+        className="mb-4 w-full rounded-xl border border-border bg-card px-4 py-2.5 outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/30"
+      />
+      {filtered.length === 0 ? (
+        <p className="py-10 text-center text-sm text-muted">No matches.</p>
+      ) : (
+        <ul className="grid gap-3 sm:grid-cols-2">
+          {filtered.map((c) => (
+            <li
+              key={c.id}
+              className="group flex items-center gap-3 rounded-2xl border border-border bg-card p-4 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md"
+            >
+              <Avatar name={c.name} />
+              <button onClick={() => canCall && onCall(c.phone_number, c.name)} className="min-w-0 flex-1 text-left">
+                <p className="truncate font-semibold">{c.name}</p>
+                <p className="truncate text-sm text-muted">{prettyNumber(c.phone_number)}</p>
+              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => onCall(c.phone_number, c.name)}
+                  aria-label={`Call ${c.name}`}
+                  className="press grid h-10 w-10 place-items-center rounded-full bg-accent/10 text-accent transition hover:bg-accent/20"
+                >
+                  <PhoneIcon className="h-5 w-5" />
+                </button>
+                <button
+                  onClick={() => onEdit(c)}
+                  aria-label={`Edit ${c.name}`}
+                  className="press grid h-9 w-9 place-items-center rounded-full text-muted opacity-60 transition hover:bg-foreground/5 hover:text-foreground md:opacity-0 md:group-hover:opacity-100"
+                >
+                  <PencilIcon className="h-4 w-4" />
+                </button>
+                <button
+                  onClick={() => onDelete(c.id)}
+                  aria-label={`Delete ${c.name}`}
+                  className="press grid h-9 w-9 place-items-center rounded-full text-muted opacity-60 transition hover:bg-red-500/10 hover:text-red-600 md:opacity-0 md:group-hover:opacity-100"
+                >
+                  ✕
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
 /* ----------------------------- Keypad ----------------------------- */
 function KeypadView({
-  value,
-  setValue,
-  canCall,
-  disabledReason,
-  onCall,
-  onSaveContact,
+  value, setValue, canCall, disabledReason, onCall, onSaveContact,
 }: {
   value: string;
   setValue: (v: string) => void;
@@ -437,59 +520,68 @@ function KeypadView({
   onCall: () => void;
   onSaveContact: () => void;
 }) {
+  const dtmf = useDtmf();
   const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#'];
   const sub: Record<string, string> = {
     '2': 'ABC', '3': 'DEF', '4': 'GHI', '5': 'JKL',
-    '6': 'MNO', '7': 'PQRS', '8': 'TUV', '9': 'WXYZ', '0': '+',
+    '6': 'MNO', '7': 'PQRS', '8': 'TUV', '9': 'WXYZ',
   };
+  const press = (k: string) => {
+    setValue(value + k);
+    dtmf(k);
+  };
+
   return (
-    <div className="mx-auto flex w-full max-w-sm flex-col items-center pt-2">
-      <div className="flex min-h-[4rem] items-center justify-center">
-        <span className="truncate text-center text-4xl font-light tracking-wide">
-          {value || <span className="text-muted/50">Enter a number</span>}
+    <div className="mx-auto flex w-full max-w-[19rem] flex-col items-center pt-4">
+      <div className="flex min-h-[3.5rem] items-center justify-center">
+        <span className="truncate text-center text-[2.1rem] font-light tracking-wide">
+          {formatDial(value) || <span className="text-muted/40">Enter a number</span>}
         </span>
       </div>
 
-      <div className="grid w-full grid-cols-3 gap-3 py-4">
+      <div className="grid w-full grid-cols-3 gap-x-5 gap-y-4 py-5">
         {keys.map((k) => (
           <button
             key={k}
-            onClick={() => setValue(value + k)}
+            onClick={() => press(k)}
             onContextMenu={(e) => {
               if (k === '0') {
                 e.preventDefault();
                 setValue(value + '+');
               }
             }}
-            className="press mx-auto grid h-[4.4rem] w-[4.4rem] place-items-center rounded-full border border-border bg-card shadow-sm active:bg-accent/10"
+            className="press relative mx-auto grid h-[4.25rem] w-[4.25rem] place-items-center rounded-full border border-border bg-card shadow-sm transition hover:bg-accent/5 active:bg-accent/10"
           >
-            <span className="text-3xl font-light leading-none">{k}</span>
-            {sub[k] && <span className="mt-0.5 text-[10px] font-semibold tracking-widest text-muted">{sub[k]}</span>}
+            <span className="text-[1.75rem] font-normal leading-none">{k}</span>
+            {sub[k] && (
+              <span className="absolute bottom-[0.7rem] text-[0.5rem] font-semibold tracking-[0.18em] text-muted">
+                {sub[k]}
+              </span>
+            )}
+            {k === '0' && (
+              <span className="absolute bottom-[0.7rem] text-[0.6rem] font-semibold text-muted">+</span>
+            )}
           </button>
         ))}
       </div>
 
-      <div className="flex w-full items-center justify-center gap-8 pt-2">
+      <div className="flex w-full items-center justify-center gap-8 pt-1">
         <div className="w-12 text-center">
           {value && (
-            <button onClick={onSaveContact} className="press text-sm font-semibold text-accent">
-              Save
-            </button>
+            <button onClick={onSaveContact} className="press text-sm font-semibold text-accent">Save</button>
           )}
         </div>
         <button
           onClick={onCall}
           disabled={!canCall || !value}
           title={disabledReason}
-          className="press grid h-[4.8rem] w-[4.8rem] place-items-center rounded-full bg-accent text-white shadow-lg shadow-accent/30 disabled:opacity-40"
+          className="press grid h-[4.6rem] w-[4.6rem] place-items-center rounded-full bg-accent text-white shadow-lg shadow-accent/30 transition hover:brightness-110 disabled:opacity-40 disabled:shadow-none"
         >
           <PhoneIcon className="h-7 w-7" />
         </button>
         <div className="w-12 text-center">
           {value && (
-            <button onClick={() => setValue(value.slice(0, -1))} aria-label="Backspace" className="press text-2xl text-muted">
-              ⌫
-            </button>
+            <button onClick={() => setValue(value.slice(0, -1))} aria-label="Backspace" className="press text-2xl text-muted">⌫</button>
           )}
         </div>
       </div>
@@ -500,15 +592,13 @@ function KeypadView({
 
 /* ----------------------------- Recents ----------------------------- */
 function RecentsView({
-  recents,
-  contacts,
-  canCall,
-  onCall,
+  recents, contacts, canCall, onCall, onSave,
 }: {
   recents: CallRow[];
   contacts: Contact[];
   canCall: boolean;
   onCall: (n: string, name: string) => void;
+  onSave: (num: string) => void;
 }) {
   if (recents.length === 0) {
     return <EmptyState emoji="🕘" title="No recent calls" body="Calls you make will show up here." />;
@@ -518,20 +608,24 @@ function RecentsView({
     <ul className="mx-auto flex w-full max-w-2xl flex-col gap-2">
       {recents.map((r, i) => {
         const name = nameFor(r.to_number);
+        const known = !!name;
         return (
           <li key={i} className="flex items-center gap-3 rounded-2xl border border-border bg-card p-4 shadow-sm">
-            <Avatar text={name ? initials(name) : '📞'} />
+            {known ? <Avatar name={name} /> : <div className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-muted/15 text-lg">📞</div>}
             <div className="min-w-0 flex-1">
               <p className="truncate font-semibold">{name || prettyNumber(r.to_number)}</p>
-              <p className="text-sm text-muted">
-                {mmss(r.seconds)} · {new Date(r.created_at).toLocaleDateString()}
-              </p>
+              <p className="text-sm text-muted">{mmss(r.seconds)} · {new Date(r.created_at).toLocaleDateString()}</p>
             </div>
+            {!known && (
+              <button onClick={() => onSave(r.to_number)} className="press rounded-full px-3 py-1 text-sm font-semibold text-accent hover:bg-accent/10">
+                Save
+              </button>
+            )}
             {canCall && (
               <button
                 onClick={() => onCall(r.to_number, name)}
                 aria-label="Call back"
-                className="press grid h-10 w-10 place-items-center rounded-full bg-accent/10 text-accent"
+                className="press grid h-10 w-10 place-items-center rounded-full bg-accent/10 text-accent transition hover:bg-accent/20"
               >
                 <PhoneIcon className="h-5 w-5" />
               </button>
@@ -545,10 +639,7 @@ function RecentsView({
 
 /* ----------------------------- Account / Buy time ----------------------------- */
 function AccountView({
-  email,
-  balanceSeconds,
-  testTopupEnabled,
-  onPurchased,
+  email, balanceSeconds, testTopupEnabled, onPurchased,
 }: {
   email: string;
   balanceSeconds: number;
@@ -556,7 +647,7 @@ function AccountView({
   onPurchased: () => void;
 }) {
   const [pending, startTransition] = useTransition();
-  const [busyId, setBusyId] = useState<string>('');
+  const [busyId, setBusyId] = useState('');
   const [error, setError] = useState('');
   const [customMin, setCustomMin] = useState(CUSTOM_MIN_MINUTES);
 
@@ -577,9 +668,7 @@ function AccountView({
         <div className="flex items-center justify-between">
           <p className="text-sm text-white/80">Call time left</p>
           {testTopupEnabled && (
-            <span className="rounded-full bg-white/20 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide">
-              Test mode
-            </span>
+            <span className="rounded-full bg-white/20 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide">Test mode</span>
           )}
         </div>
         <p className="mt-1 text-5xl font-bold tabular-nums">{formatDuration(balanceSeconds)}</p>
@@ -597,16 +686,12 @@ function AccountView({
                 key={p.id}
                 disabled={pending}
                 onClick={() => purchase(p.id, { packageId: p.id })}
-                className="press flex flex-col items-start gap-1 rounded-2xl border border-border p-4 text-left transition hover:border-accent hover:shadow-md disabled:opacity-60"
+                className="press flex flex-col items-start gap-1 rounded-2xl border border-border p-4 text-left transition hover:-translate-y-0.5 hover:border-accent hover:shadow-md disabled:opacity-60"
               >
                 <span className="text-2xl font-bold">{formatPrice(p.priceCents)}</span>
                 <span className="font-semibold">{p.label}</span>
-                <span className="text-xs text-muted">
-                  {p.blurb} · {ratePerMinCents(p.priceCents, p.minutes)}¢/min
-                </span>
-                <span className="mt-1 text-xs font-semibold text-accent">
-                  {busyId === p.id ? 'Adding…' : 'Buy'}
-                </span>
+                <span className="text-xs text-muted">{p.blurb} · {ratePerMinCents(p.priceCents, p.minutes)}¢/min</span>
+                <span className="mt-1 text-xs font-semibold text-accent">{busyId === p.id ? 'Adding…' : 'Buy'}</span>
               </button>
             ))}
           </div>
@@ -645,9 +730,7 @@ function AccountView({
       </div>
 
       <form action={signOut} className="md:hidden">
-        <button className="press w-full rounded-2xl border border-border bg-card py-3 font-semibold text-red-600 shadow-sm">
-          Log out
-        </button>
+        <button className="press w-full rounded-2xl border border-border bg-card py-3 font-semibold text-red-600 shadow-sm">Log out</button>
       </form>
     </div>
   );
@@ -655,10 +738,7 @@ function AccountView({
 
 /* ----------------------------- Call overlay ----------------------------- */
 function CallOverlay({
-  peer,
-  state,
-  seconds,
-  onHangUp,
+  peer, state, seconds, onHangUp,
 }: {
   peer: { name: string; number: string };
   state: CallState;
@@ -669,39 +749,31 @@ function CallOverlay({
   return (
     <div className="fixed inset-0 z-50 flex animate-fade-in flex-col items-center justify-center gap-10 bg-gradient-to-b from-neutral-900/95 to-black/95 px-6 text-white backdrop-blur">
       <div className="flex flex-col items-center gap-4">
-        <div
-          className={`grid h-32 w-32 place-items-center rounded-full bg-white/10 text-5xl font-semibold ${
-            state === 'live' ? 'pulse-ring' : ''
-          }`}
-        >
+        <div className={`grid h-32 w-32 place-items-center rounded-full ${peer.name ? colorFor(peer.name) : 'bg-white/10'} text-5xl font-semibold ${state === 'live' ? 'pulse-ring' : ''}`}>
           {peer.name ? initials(peer.name) : '📞'}
         </div>
         <p className="text-3xl font-semibold">{peer.name || prettyNumber(peer.number)}</p>
         <p className="text-white/70">{label}</p>
       </div>
-      <button
-        onClick={onHangUp}
-        aria-label="Hang up"
-        className="press grid h-16 w-16 place-items-center rounded-full bg-red-600 shadow-lg"
-      >
+      <button onClick={onHangUp} aria-label="Hang up" className="press grid h-16 w-16 place-items-center rounded-full bg-red-600 shadow-lg transition hover:brightness-110">
         <PhoneIcon className="h-7 w-7 rotate-[135deg]" />
       </button>
     </div>
   );
 }
 
-/* ----------------------------- Add contact ----------------------------- */
-function AddContactSheet({
-  prefill,
-  onClose,
-  onSave,
+/* ----------------------------- Add/Edit contact ----------------------------- */
+function ContactSheet({
+  mode, initial, prefill, onClose, onSave,
 }: {
-  prefill: string;
+  mode: 'add' | 'edit';
+  initial?: Contact;
+  prefill?: string;
   onClose: () => void;
   onSave: (name: string, number: string) => Promise<string | null>;
 }) {
-  const [name, setName] = useState('');
-  const [number, setNumber] = useState(prefill);
+  const [name, setName] = useState(initial?.name ?? '');
+  const [number, setNumber] = useState(initial?.phone_number ?? prefill ?? '');
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
 
@@ -717,42 +789,20 @@ function AddContactSheet({
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex animate-fade-in items-end justify-center bg-black/40 md:items-center"
-      onClick={onClose}
-    >
-      <div
-        className="animate-slide-up w-full rounded-t-3xl bg-card p-6 shadow-2xl md:max-w-md md:rounded-3xl"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <div className="fixed inset-0 z-50 flex animate-fade-in items-end justify-center bg-black/40 md:items-center" onClick={onClose}>
+      <div className="animate-slide-up w-full rounded-t-3xl bg-card p-6 shadow-2xl md:max-w-md md:rounded-3xl" onClick={(e) => e.stopPropagation()}>
         <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-xl font-bold">New contact</h2>
-          <button onClick={onClose} className="text-sm font-semibold text-muted">
-            Cancel
-          </button>
+          <h2 className="text-xl font-bold">{mode === 'edit' ? 'Edit contact' : 'New contact'}</h2>
+          <button onClick={onClose} className="text-sm font-semibold text-muted">Cancel</button>
         </div>
         <div className="flex flex-col gap-3">
-          <input
-            autoFocus
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Name"
-            className="rounded-xl border border-border bg-background px-4 py-2.5 outline-none focus:border-accent focus:ring-2 focus:ring-accent/30"
-          />
-          <input
-            value={number}
-            onChange={(e) => setNumber(e.target.value)}
-            placeholder="Phone number"
-            inputMode="tel"
-            className="rounded-xl border border-border bg-background px-4 py-2.5 outline-none focus:border-accent focus:ring-2 focus:ring-accent/30"
-          />
+          <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Name"
+            className="rounded-xl border border-border bg-background px-4 py-2.5 outline-none focus:border-accent focus:ring-2 focus:ring-accent/30" />
+          <input value={number} onChange={(e) => setNumber(e.target.value)} placeholder="Phone number" inputMode="tel"
+            className="rounded-xl border border-border bg-background px-4 py-2.5 outline-none focus:border-accent focus:ring-2 focus:ring-accent/30" />
           {error && <p className="text-sm text-red-600">{error}</p>}
-          <button
-            onClick={save}
-            disabled={saving}
-            className="press mt-1 rounded-xl bg-accent py-2.5 font-semibold text-white disabled:opacity-60"
-          >
-            {saving ? 'Saving…' : 'Save contact'}
+          <button onClick={save} disabled={saving} className="press mt-1 rounded-xl bg-accent py-2.5 font-semibold text-white disabled:opacity-60">
+            {saving ? 'Saving…' : mode === 'edit' ? 'Save changes' : 'Save contact'}
           </button>
         </div>
       </div>
@@ -761,19 +811,16 @@ function AddContactSheet({
 }
 
 /* ----------------------------- bits ----------------------------- */
-function Avatar({ text }: { text: string }) {
+function Avatar({ name }: { name: string }) {
   return (
-    <div className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-accent/15 text-sm font-bold text-accent">
-      {text}
+    <div className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${colorFor(name)} text-sm font-bold text-white`}>
+      {initials(name)}
     </div>
   );
 }
 
 function EmptyState({
-  emoji,
-  title,
-  body,
-  action,
+  emoji, title, body, action,
 }: {
   emoji: string;
   title: string;
@@ -786,12 +833,7 @@ function EmptyState({
       <p className="text-lg font-semibold">{title}</p>
       <p className="max-w-xs text-sm text-muted">{body}</p>
       {action && (
-        <button
-          onClick={action.onClick}
-          className="press mt-2 rounded-full bg-accent px-5 py-2 font-semibold text-white"
-        >
-          {action.label}
-        </button>
+        <button onClick={action.onClick} className="press mt-2 rounded-full bg-accent px-5 py-2 font-semibold text-white">{action.label}</button>
       )}
     </div>
   );
@@ -799,7 +841,7 @@ function EmptyState({
 
 function PhoneBadge() {
   return (
-    <span className="grid h-8 w-8 place-items-center rounded-xl bg-accent text-white">
+    <span className="grid h-8 w-8 place-items-center rounded-xl bg-accent text-white shadow-sm">
       <PhoneIcon className="h-4 w-4" />
     </span>
   );
@@ -816,6 +858,14 @@ function PhoneIcon({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" className={className}>
       <path d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.6 21 3 13.4 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.4 0 .8-.3 1l-2.2 2.2z" />
+    </svg>
+  );
+}
+function PencilIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={className}>
+      <path d="M4 20h4L18 10l-4-4L4 16v4z" strokeLinejoin="round" />
+      <path d="M13.5 6.5l4 4" strokeLinecap="round" />
     </svg>
   );
 }

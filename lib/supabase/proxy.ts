@@ -6,8 +6,9 @@
 import { createServerClient } from '@supabase/ssr';
 import { NextResponse, type NextRequest } from 'next/server';
 
-// Paths a signed-out user is allowed to reach.
-const PUBLIC_PREFIXES = ['/login', '/auth'];
+// Only these path prefixes require a session. Everything else (the landing
+// page, /login, static) is public.
+const PROTECTED_PREFIXES = ['/app'];
 
 export async function updateSession(request: NextRequest) {
   let response = NextResponse.next({ request });
@@ -40,11 +41,19 @@ export async function updateSession(request: NextRequest) {
   } = await supabase.auth.getUser();
 
   const { pathname } = request.nextUrl;
-  const isPublic = PUBLIC_PREFIXES.some((p) => pathname.startsWith(p));
+  const isProtected = PROTECTED_PREFIXES.some((p) => pathname.startsWith(p));
 
-  if (!user && !isPublic) {
+  // Signed-out users can't reach the app.
+  if (!user && isProtected) {
     const url = request.nextUrl.clone();
     url.pathname = '/login';
+    return NextResponse.redirect(url);
+  }
+
+  // Signed-in users hitting /login go straight to the app.
+  if (user && pathname.startsWith('/login')) {
+    const url = request.nextUrl.clone();
+    url.pathname = '/app';
     return NextResponse.redirect(url);
   }
 

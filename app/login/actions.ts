@@ -28,7 +28,7 @@ export async function login(formData: FormData) {
   if (error) backToLogin(error.message);
 
   revalidatePath('/', 'layout');
-  redirect('/');
+  redirect('/app');
 }
 
 export async function signup(formData: FormData) {
@@ -47,7 +47,7 @@ export async function signup(formData: FormData) {
   // a session exists immediately and we can go straight to the app.
   if (data.session) {
     revalidatePath('/', 'layout');
-    redirect('/');
+    redirect('/app');
   }
   redirect(
     `/login?message=${encodeURIComponent('Account created. Check your email to confirm, then log in.')}`,
@@ -58,5 +58,5 @@ export async function signOut() {
   const supabase = await createClient();
   await supabase.auth.signOut();
   revalidatePath('/', 'layout');
-  redirect('/login');
+  redirect('/');
 }
