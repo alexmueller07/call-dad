@@ -35,6 +35,12 @@ export function Dialer() {
     (async () => {
       try {
         const res = await fetch('/api/token');
+        if (res.status === 403) {
+          // Calling allowlist (temporary, until the any-number dialer ships).
+          // Keep buttons disabled and show a friendly, non-alarming note.
+          if (!cancelled) setMessage("Calling isn't enabled for your account yet — coming soon.");
+          return;
+        }
         if (!res.ok) throw new Error(`token request failed (${res.status})`);
         const { token } = await res.json();
 
