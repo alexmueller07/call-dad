@@ -11,6 +11,7 @@ import {
 import type { Call, Device } from '@twilio/voice-sdk';
 import { createClient } from '@/lib/supabase/client';
 import { isValidE164, normalizeNumber } from '@/lib/calling';
+import { parseContacts } from '@/lib/import-contacts';
 import {
   PACKAGES,
   CUSTOM_MIN_MINUTES,
@@ -29,6 +30,8 @@ type Tab = 'contacts' | 'keypad' | 'recents' | 'account';
 type Contact = { id: string; name: string; phone_number: string; is_favorite?: boolean };
 type CallRow = { to_number: string; seconds: number; created_at: string };
 type CallState = 'idle' | 'connecting' | 'live' | 'ended';
+type Quality = 'good' | 'poor';
+type OutputDevice = { id: string; label: string };
 
 type Props = {
   userId: string;
@@ -108,6 +111,7 @@ const NAV: { key: Tab; label: string }[] = [
 
 export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTopupEnabled }: Props) {
   const supabase = useMemo(() => createClient(), []);
+  const dtmf = useDtmf();
 
   const [tab, setTab] = useState<Tab>('keypad');
   const [balanceSeconds, setBalanceSeconds] = useState(initialBalanceSeconds);
@@ -116,17 +120,25 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
   const [keypad, setKeypad] = useState('');
   const [sheet, setSheet] = useState<{ mode: 'add' | 'edit'; contact?: Contact; prefill?: string } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [importMsg, setImportMsg] = useState('');
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const hasTime = balanceSeconds > 0;
 
   const deviceRef = useRef<Device | null>(null);
   const callRef = useRef<Call | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const warningsRef = useRef<Set<string>>(new Set());
   const [deviceReady, setDeviceReady] = useState(false);
   const [callState, setCallState] = useState<CallState>('idle');
   const [callPeer, setCallPeer] = useState<{ name: string; number: string }>({ name: '', number: '' });
   const [seconds, setSeconds] = useState(0);
   const [muted, setMuted] = useState(false);
+  const [quality, setQuality] = useState<Quality>('good');
+  const [reconnecting, setReconnecting] = useState(false);
+  const [outputs, setOutputs] = useState<OutputDevice[]>([]);
+  const [currentOutput, setCurrentOutput] = useState('');
+  const [outputSupported, setOutputSupported] = useState(false);
 
   useEffect(() => {
     if (!canCall) return;
@@ -140,10 +152,32 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
         if (cancelled) return;
         const device = new Device(token, { logLevel: 1 });
         device.on('error', () => {});
+        // Keep long sessions alive: refresh the token before it expires.
+        device.on('tokenWillExpire', async () => {
+          try {
+            const r = await fetch('/api/token');
+            if (r.ok) device.updateToken((await r.json()).token);
+          } catch { /* ignore */ }
+        });
         await device.register();
         if (cancelled) return;
         deviceRef.current = device;
         setDeviceReady(true);
+
+        const audio = device.audio;
+        if (audio?.isOutputSelectionSupported) {
+          setOutputSupported(true);
+          const refresh = () => {
+            setOutputs(
+              Array.from(audio.availableOutputDevices.entries()).map(([id, info]) => ({
+                id,
+                label: info.label || 'Output device',
+              })),
+            );
+          };
+          refresh();
+          audio.on('deviceChange', refresh);
+        }
       } catch {
         /* ignore */
       }
@@ -158,7 +192,6 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
 
   const loadContacts = useCallback(async () => {
     const withFav = await supabase.from('contacts').select('id,name,phone_number,is_favorite').order('name', { ascending: true });
-    // Fall back if the is_favorite column hasn't been migrated yet.
     const data = withFav.error
       ? (await supabase.from('contacts').select('id,name,phone_number').order('name', { ascending: true })).data
       : withFav.data;
@@ -185,6 +218,12 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
     loadRecents();
   }, [loadContacts, loadRecents]);
 
+  useEffect(() => {
+    if (!importMsg) return;
+    const t = setTimeout(() => setImportMsg(''), 4000);
+    return () => clearTimeout(t);
+  }, [importMsg]);
+
   const startTimer = () => {
     setSeconds(0);
     timerRef.current = setInterval(() => setSeconds((s) => s + 1), 1000);
@@ -203,18 +242,36 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
       }
       const number = normalizeNumber(rawNumber);
       if (!deviceRef.current || !isValidE164(number)) return;
+
       setMuted(false);
+      setQuality('good');
+      setReconnecting(false);
+      warningsRef.current.clear();
       setCallPeer({ name: name || prettyNumber(number), number });
       setCallState('connecting');
+
       const call = await deviceRef.current.connect({ params: { To: number } });
       callRef.current = call;
+
       call.on('accept', () => {
         setCallState('live');
         startTimer();
       });
+      call.on('warning', (w: string) => {
+        warningsRef.current.add(w);
+        setQuality('poor');
+      });
+      call.on('warning-cleared', (w: string) => {
+        warningsRef.current.delete(w);
+        if (warningsRef.current.size === 0) setQuality('good');
+      });
+      call.on('reconnecting', () => setReconnecting(true));
+      call.on('reconnected', () => setReconnecting(false));
+
       const onEnd = () => {
         stopTimer();
         callRef.current = null;
+        setReconnecting(false);
         setCallState('ended');
         loadRecents();
         refreshBalance();
@@ -236,9 +293,26 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
     callRef.current?.mute(next);
     setMuted(next);
   }, [muted]);
-  const sendDigit = useCallback((d: string) => {
-    callRef.current?.sendDigits(d);
+  const sendDigit = useCallback((d: string) => { callRef.current?.sendDigits(d); }, []);
+  const setOutput = useCallback((id: string) => {
+    deviceRef.current?.audio?.speakerDevices.set(id).catch(() => {});
+    setCurrentOutput(id);
   }, []);
+
+  // Keyboard support on the keypad.
+  useEffect(() => {
+    if (tab !== 'keypad' || callState !== 'idle' || sheet || settingsOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return;
+      if (/^[0-9*#]$/.test(e.key)) { setKeypad((v) => v + e.key); dtmf(e.key); }
+      else if (e.key === '+') setKeypad((v) => v + '+');
+      else if (e.key === 'Backspace') setKeypad((v) => v.slice(0, -1));
+      else if (e.key === 'Enter' && keypad) placeCall(keypad, '');
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [tab, callState, sheet, settingsOpen, keypad, placeCall, dtmf]);
 
   const toggleFavorite = async (c: Contact) => {
     setContacts((prev) => prev.map((x) => (x.id === c.id ? { ...x, is_favorite: !x.is_favorite } : x)));
@@ -260,6 +334,26 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
     return null;
   };
 
+  const importContacts = async (file: File) => {
+    setImportMsg('Reading…');
+    try {
+      const parsed = parseContacts(await file.text(), file.name);
+      if (!parsed.length) return setImportMsg('No valid phone numbers found in that file.');
+      const existing = new Set(contacts.map((c) => c.phone_number));
+      const toInsert = parsed
+        .filter((p) => !existing.has(p.phone))
+        .map((p) => ({ user_id: userId, name: p.name, phone_number: p.phone }));
+      if (!toInsert.length) return setImportMsg('Those contacts are already saved.');
+      const { error } = await supabase.from('contacts').insert(toInsert);
+      if (error) return setImportMsg(error.message);
+      setImportMsg(`Imported ${toInsert.length} contact${toInsert.length > 1 ? 's' : ''}.`);
+      loadContacts();
+      setTab('contacts');
+    } catch {
+      setImportMsg('Could not read that file.');
+    }
+  };
+
   const callableNow = canCall && deviceReady && hasTime;
   const callDisabledReason = !canCall
     ? "Calling isn't enabled for your account yet."
@@ -273,7 +367,6 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
 
   return (
     <div className="flex min-h-screen w-full">
-      {/* Sidebar */}
       <aside className="sticky top-0 hidden h-screen w-64 shrink-0 flex-col border-r border-border bg-card/60 p-5 backdrop-blur md:flex">
         <div className="mb-7 flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -306,7 +399,6 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
       </aside>
 
       <div className="flex min-h-screen flex-1 flex-col">
-        {/* Mobile top bar */}
         <header className="flex items-center justify-between border-b border-border bg-card/60 px-4 py-3 backdrop-blur md:hidden">
           <div className="flex items-center gap-2">
             <PhoneBadge />
@@ -322,13 +414,8 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
           </div>
         </header>
 
-        <div className="hidden items-center justify-between px-8 pt-7 md:flex">
+        <div className="hidden items-center px-8 pt-7 md:flex">
           <h1 className="text-3xl font-bold tracking-tight">{titles[tab]}</h1>
-          {tab === 'contacts' && (
-            <button onClick={() => setSheet({ mode: 'add' })} className="press flex items-center gap-2 rounded-full bg-accent px-4 py-2 font-semibold text-white shadow transition hover:brightness-110">
-              <span className="text-lg leading-none">+</span> Add contact
-            </button>
-          )}
         </div>
 
         {!canCall && (
@@ -352,10 +439,11 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
               onDelete={async (id) => { await supabase.from('contacts').delete().eq('id', id); loadContacts(); }}
               onToggleFavorite={toggleFavorite}
               onAdd={() => setSheet({ mode: 'add' })}
+              onImport={() => fileInputRef.current?.click()}
             />
           )}
           {tab === 'keypad' && (
-            <KeypadView value={keypad} setValue={setKeypad} canCall={callableNow} disabledReason={callDisabledReason} onCall={() => placeCall(keypad, '')} onSaveContact={() => setSheet({ mode: 'add', prefill: keypad })} />
+            <KeypadView value={keypad} setValue={setKeypad} dtmf={dtmf} canCall={callableNow} disabledReason={callDisabledReason} onCall={() => placeCall(keypad, '')} onSaveContact={() => setSheet({ mode: 'add', prefill: keypad })} />
           )}
           {tab === 'recents' && (
             <RecentsView recents={recents} contacts={contacts} canCall={callableNow} onCall={placeCall} onSave={(num) => setSheet({ mode: 'add', prefill: num })} />
@@ -378,8 +466,41 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
         </nav>
       </div>
 
+      {/* hidden import file picker */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".vcf,.csv,text/vcard,text/csv"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) importContacts(f);
+          e.target.value = '';
+        }}
+      />
+
+      {importMsg && (
+        <div className="fixed inset-x-0 bottom-24 z-40 mx-auto w-fit animate-slide-up rounded-full bg-foreground px-4 py-2 text-sm font-medium text-background shadow-lg md:bottom-6">
+          {importMsg}
+        </div>
+      )}
+
       {callState !== 'idle' && (
-        <CallOverlay peer={callPeer} state={callState} seconds={seconds} muted={muted} onToggleMute={toggleMute} onSendDigit={sendDigit} onHangUp={hangUp} />
+        <CallOverlay
+          peer={callPeer}
+          state={callState}
+          seconds={seconds}
+          muted={muted}
+          quality={quality}
+          reconnecting={reconnecting}
+          outputs={outputs}
+          currentOutput={currentOutput}
+          outputSupported={outputSupported}
+          onSetOutput={setOutput}
+          onToggleMute={toggleMute}
+          onSendDigit={sendDigit}
+          onHangUp={hangUp}
+        />
       )}
 
       {sheet && (
@@ -431,9 +552,7 @@ function Settings({ email, onClose }: { email: string; onClose: () => void }) {
 
         <Section title="Account">
           <Row label="Email" value={email} />
-          <button onClick={sendReset} className="press mt-2 w-full rounded-xl border border-border bg-card py-2.5 text-sm font-semibold transition hover:bg-foreground/5">
-            Change password
-          </button>
+          <button onClick={sendReset} className="press mt-2 w-full rounded-xl border border-border bg-card py-2.5 text-sm font-semibold transition hover:bg-foreground/5">Change password</button>
           {pwMsg && <p className="mt-2 text-xs text-muted">{pwMsg}</p>}
         </Section>
 
@@ -446,19 +565,13 @@ function Settings({ email, onClose }: { email: string; onClose: () => void }) {
 
         <Section title="Danger zone">
           {!confirmDelete ? (
-            <button onClick={() => setConfirmDelete(true)} className="press w-full rounded-xl border border-red-500/30 bg-red-500/5 py-2.5 text-sm font-semibold text-red-600 transition hover:bg-red-500/10">
-              Delete account
-            </button>
+            <button onClick={() => setConfirmDelete(true)} className="press w-full rounded-xl border border-red-500/30 bg-red-500/5 py-2.5 text-sm font-semibold text-red-600 transition hover:bg-red-500/10">Delete account</button>
           ) : (
             <div className="rounded-xl border border-red-500/30 bg-red-500/5 p-4">
               <p className="text-sm font-medium text-red-600">Permanently delete your account, contacts, and call history?</p>
               <div className="mt-3 flex gap-2">
                 <button onClick={() => setConfirmDelete(false)} className="press flex-1 rounded-lg border border-border bg-card py-2 text-sm font-semibold">Cancel</button>
-                <button
-                  disabled={deleting}
-                  onClick={() => startDelete(async () => { const r = await deleteAccount(); if (r.ok) window.location.href = '/'; })}
-                  className="press flex-1 rounded-lg bg-red-600 py-2 text-sm font-semibold text-white disabled:opacity-60"
-                >
+                <button disabled={deleting} onClick={() => startDelete(async () => { const r = await deleteAccount(); if (r.ok) window.location.href = '/'; })} className="press flex-1 rounded-lg bg-red-600 py-2 text-sm font-semibold text-white disabled:opacity-60">
                   {deleting ? 'Deleting…' : 'Delete forever'}
                 </button>
               </div>
@@ -490,7 +603,6 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-/* ----------------------------- Sidebar nav button ----------------------------- */
 function NavButton({ item, active, onClick }: { item: { key: Tab; label: string }; active: boolean; onClick: () => void }) {
   return (
     <button onClick={onClick} className={`press flex items-center gap-3 rounded-xl px-3 py-2.5 text-left font-medium transition ${active ? 'bg-accent/10 text-accent' : 'text-foreground/70 hover:bg-foreground/5'}`}>
@@ -535,7 +647,7 @@ function ContactRow({
 }
 
 function ContactsView({
-  contacts, canCall, onCall, onEdit, onDelete, onToggleFavorite, onAdd,
+  contacts, canCall, onCall, onEdit, onDelete, onToggleFavorite, onAdd, onImport,
 }: {
   contacts: Contact[];
   canCall: boolean;
@@ -544,19 +656,37 @@ function ContactsView({
   onDelete: (id: string) => void;
   onToggleFavorite: (c: Contact) => void;
   onAdd: () => void;
+  onImport: () => void;
 }) {
   const [q, setQ] = useState('');
+  const rowProps = { canCall, onCall, onEdit, onDelete, onToggleFavorite };
+
   if (contacts.length === 0) {
-    return <EmptyState emoji="👋" title="No contacts yet" body="Add the people you call most for one-tap dialing." action={{ label: '+ Add contact', onClick: onAdd }} />;
+    return (
+      <div className="flex min-h-[50vh] flex-col items-center justify-center gap-3 px-8 text-center">
+        <div className="text-5xl">👋</div>
+        <p className="text-lg font-semibold">No contacts yet</p>
+        <p className="max-w-xs text-sm text-muted">Add the people you call most, or import them from your phone.</p>
+        <div className="mt-2 flex gap-2">
+          <button onClick={onAdd} className="press rounded-full bg-accent px-5 py-2 font-semibold text-white">+ Add contact</button>
+          <button onClick={onImport} className="press rounded-full border border-border px-5 py-2 font-semibold transition hover:bg-foreground/5">Import</button>
+        </div>
+        <p className="mt-1 text-xs text-muted">Import a .vcf (phone export) or .csv file.</p>
+      </div>
+    );
   }
+
   const filtered = contacts.filter((c) => c.name.toLowerCase().includes(q.toLowerCase()) || c.phone_number.includes(q.replace(/\D/g, '')));
   const favs = filtered.filter((c) => c.is_favorite);
   const rest = filtered.filter((c) => !c.is_favorite);
 
-  const rowProps = { canCall, onCall, onEdit, onDelete, onToggleFavorite };
   return (
     <div className="mx-auto w-full max-w-4xl">
-      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search contacts" className="mb-4 w-full rounded-xl border border-border bg-card px-4 py-2.5 outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/30" />
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search contacts" className="min-w-0 flex-1 rounded-xl border border-border bg-card px-4 py-2.5 outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/30" />
+        <button onClick={onAdd} className="press rounded-xl bg-accent px-4 py-2.5 font-semibold text-white transition hover:brightness-110">+ Add</button>
+        <button onClick={onImport} className="press rounded-xl border border-border px-4 py-2.5 font-semibold transition hover:bg-foreground/5">Import</button>
+      </div>
       {filtered.length === 0 ? (
         <p className="py-10 text-center text-sm text-muted">No matches.</p>
       ) : (
@@ -587,16 +717,16 @@ function ContactsView({
 
 /* ----------------------------- Keypad ----------------------------- */
 function KeypadView({
-  value, setValue, canCall, disabledReason, onCall, onSaveContact,
+  value, setValue, dtmf, canCall, disabledReason, onCall, onSaveContact,
 }: {
   value: string;
   setValue: (v: string) => void;
+  dtmf: (k: string) => void;
   canCall: boolean;
   disabledReason: string;
   onCall: () => void;
   onSaveContact: () => void;
 }) {
-  const dtmf = useDtmf();
   const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#'];
   const sub: Record<string, string> = {
     '2': 'ABC', '3': 'DEF', '4': 'GHI', '5': 'JKL', '6': 'MNO', '7': 'PQRS', '8': 'TUV', '9': 'WXYZ',
@@ -633,7 +763,8 @@ function KeypadView({
         </button>
         <div className="w-12 text-center">{value && <button onClick={() => setValue(value.slice(0, -1))} aria-label="Backspace" className="press text-2xl text-muted">⌫</button>}</div>
       </div>
-      {disabledReason && <p className="pt-3 text-center text-sm text-muted">{disabledReason}</p>}
+      <p className="pt-3 text-center text-xs text-muted/70">Tip: type on your keyboard, Enter to call</p>
+      {disabledReason && <p className="pt-1 text-center text-sm text-muted">{disabledReason}</p>}
     </div>
   );
 }
@@ -750,45 +881,81 @@ function AccountView({
 }
 
 /* ----------------------------- Call overlay ----------------------------- */
+function QualityBars({ quality }: { quality: Quality }) {
+  const filled = quality === 'good' ? 4 : 2;
+  const color = quality === 'good' ? 'bg-emerald-400' : 'bg-amber-400';
+  return (
+    <div className="flex items-end gap-0.5" aria-label={`Connection ${quality}`}>
+      {[3, 6, 9, 12].map((h, i) => (
+        <span key={i} className={`w-1 rounded-sm ${i < filled ? color : 'bg-white/20'}`} style={{ height: h }} />
+      ))}
+    </div>
+  );
+}
+
 function CallOverlay({
-  peer, state, seconds, muted, onToggleMute, onSendDigit, onHangUp,
+  peer, state, seconds, muted, quality, reconnecting, outputs, currentOutput, outputSupported, onSetOutput, onToggleMute, onSendDigit, onHangUp,
 }: {
   peer: { name: string; number: string };
   state: CallState;
   seconds: number;
   muted: boolean;
+  quality: Quality;
+  reconnecting: boolean;
+  outputs: OutputDevice[];
+  currentOutput: string;
+  outputSupported: boolean;
+  onSetOutput: (id: string) => void;
   onToggleMute: () => void;
   onSendDigit: (d: string) => void;
   onHangUp: () => void;
 }) {
-  const [showKeys, setShowKeys] = useState(false);
-  const [speaker, setSpeaker] = useState(false);
-  const label = state === 'connecting' ? 'Calling…' : state === 'live' ? mmss(seconds) : 'Call ended';
+  const [panel, setPanel] = useState<'none' | 'keys' | 'output'>('none');
   const live = state === 'live';
   const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#'];
+  const label = reconnecting ? 'Reconnecting…' : state === 'connecting' ? 'Calling…' : live ? mmss(seconds) : 'Call ended';
 
   return (
     <div className="fixed inset-0 z-[55] flex animate-fade-in flex-col items-center justify-between bg-gradient-to-b from-neutral-900/95 to-black/95 px-6 py-14 text-white backdrop-blur">
       <div className="mt-6 flex flex-col items-center gap-4">
-        <div className={`grid h-32 w-32 place-items-center rounded-full ${peer.name ? colorFor(peer.name) : 'bg-white/10'} text-5xl font-semibold ${live ? 'pulse-ring' : ''}`}>
+        <div className={`grid h-32 w-32 place-items-center rounded-full ${peer.name ? colorFor(peer.name) : 'bg-white/10'} text-5xl font-semibold ${live && !reconnecting ? 'pulse-ring' : ''}`}>
           {peer.name ? initials(peer.name) : '📞'}
         </div>
         <p className="text-3xl font-semibold">{peer.name || prettyNumber(peer.number)}</p>
-        <p className="text-white/70">{label}</p>
+        <div className="flex items-center gap-2">
+          {live && !reconnecting && <QualityBars quality={quality} />}
+          <p className={reconnecting ? 'text-amber-400' : 'text-white/70'}>{label}</p>
+        </div>
+        {live && quality === 'poor' && !reconnecting && <p className="text-xs text-amber-400/80">Weak connection</p>}
       </div>
 
-      {showKeys ? (
+      {panel === 'keys' ? (
         <div className="grid w-full max-w-[15rem] grid-cols-3 gap-3">
           {keys.map((k) => (
             <button key={k} onClick={() => onSendDigit(k)} className="press grid h-14 w-14 place-items-center justify-self-center rounded-full bg-white/10 text-2xl font-light hover:bg-white/20">{k}</button>
           ))}
-          <button onClick={() => setShowKeys(false)} className="press col-span-3 mt-1 text-sm font-semibold text-white/70">Hide keypad</button>
+          <button onClick={() => setPanel('none')} className="press col-span-3 mt-1 text-sm font-semibold text-white/70">Hide keypad</button>
+        </div>
+      ) : panel === 'output' ? (
+        <div className="w-full max-w-[18rem] rounded-2xl bg-white/10 p-2">
+          <p className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-white/50">Audio output</p>
+          {outputs.length === 0 ? (
+            <p className="px-3 py-2 text-sm text-white/60">No devices found.</p>
+          ) : (
+            outputs.map((o) => (
+              <button key={o.id} onClick={() => { onSetOutput(o.id); setPanel('none'); }} className={`press flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm hover:bg-white/10 ${currentOutput === o.id || (!currentOutput && o.id === 'default') ? 'font-semibold text-emerald-300' : ''}`}>
+                <span className="truncate">{o.label}</span>
+                {(currentOutput === o.id) && <span>✓</span>}
+              </button>
+            ))
+          )}
+          <button onClick={() => setPanel('none')} className="press mt-1 w-full py-2 text-sm font-semibold text-white/70">Close</button>
         </div>
       ) : (
-        <div className="grid w-full max-w-[15rem] grid-cols-3 gap-x-6 gap-y-5">
+        <div className={`grid w-full max-w-[15rem] gap-x-6 gap-y-5 ${outputSupported ? 'grid-cols-3' : 'grid-cols-2'}`}>
           <CallCtl active={muted} disabled={!live} onClick={onToggleMute} label={muted ? 'Unmute' : 'Mute'} icon={<MuteIcon className="h-6 w-6" />} />
-          <CallCtl disabled={!live} onClick={() => setShowKeys(true)} label="Keypad" icon={<KeypadIcon className="h-6 w-6" />} />
-          <CallCtl active={speaker} disabled={!live} onClick={() => setSpeaker((s) => !s)} label="Speaker" icon={<SpeakerIcon className="h-6 w-6" />} />
+          <CallCtl disabled={!live} onClick={() => setPanel('keys')} label="Keypad" icon={<KeypadIcon className="h-6 w-6" />} />
+          {outputSupported && <CallCtl disabled={!live} onClick={() => setPanel('output')} label="Audio" icon={<SpeakerIcon className="h-6 w-6" />} />}
         </div>
       )}
 

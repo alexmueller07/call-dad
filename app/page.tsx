@@ -86,12 +86,12 @@ export default async function Landing() {
         {/* Story teaser */}
         <section className="px-5 py-16 md:px-10">
           <div className="mx-auto max-w-4xl rounded-3xl border border-white/10 bg-white/5 p-8 md:p-12">
-            <p className="font-semibold text-emerald-300">Why I built this</p>
-            <h2 className="mt-3 text-3xl font-bold leading-tight md:text-4xl">It started with a call to my dad.</h2>
+            <p className="font-semibold text-emerald-300">The story</p>
+            <h2 className="mt-3 text-3xl font-bold leading-tight md:text-4xl">I built this to call my dad.</h2>
             <p className="mt-4 max-w-2xl text-lg text-white/70">
-              I moved to South Korea, and about a month in I just missed home. Calling my dad and
-              grandpa shrank seven thousand miles down to nothing — but doing it cheaply was harder
-              than it should be. So I built CallDad.
+              I moved to South Korea and wanted to call my dad and grandpa. Doing it from abroad
+              was either expensive or a hassle, and my grandpa won&apos;t install an app to take a
+              call. I wanted something simple, so I made it.
             </p>
             <Link href="/about" className="mt-6 inline-block font-semibold text-emerald-300 hover:underline">
               Read the full story →

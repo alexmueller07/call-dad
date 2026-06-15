@@ -22,32 +22,27 @@ export default function About() {
       </header>
 
       <article className="mx-auto max-w-2xl px-6 py-16 md:py-24">
-        <p className="font-semibold text-accent">Our story</p>
+        <p className="font-semibold text-accent">The story</p>
         <h1 className="mt-3 text-4xl font-bold leading-tight md:text-5xl">
-          It started with a call to my dad.
+          I built this to call my dad.
         </h1>
 
         <div className="mt-8 space-y-5 text-lg leading-relaxed text-white/80">
           <p>
-            I moved halfway around the world to South Korea. The first few weeks were a blur —
-            new city, new language, new everything. Then about a month in, the newness wore off
-            and I just missed home.
+            I moved to South Korea. About a month in, I wanted to call my dad — and my grandpa —
+            and realized it was more of a hassle than it should be. Calling a US number from
+            abroad is either expensive or a pain, and my grandpa is not going to install an app
+            to pick up a phone call.
           </p>
           <p>
-            So I called my dad. And then my grandpa. Hearing their voices from seven thousand
-            miles away did something I didn&apos;t expect — the distance shrank. For a few minutes
-            it felt like I was back at the kitchen table.
+            What I actually wanted was simple: open my laptop, type a number, and have their
+            normal phone ring. Cheap, no setup on their end, no monthly fee. Nothing did exactly
+            that, so I made it.
           </p>
           <p>
-            The only problem was the cost. Calling internationally the normal way is expensive,
-            and my grandpa isn&apos;t about to install some app to take a call. I wanted something
-            dead simple: open my laptop, dial his regular phone, talk as long as I want, and pay
-            almost nothing.
-          </p>
-          <p>
-            That&apos;s CallDad. It&apos;s the thing I wished existed when I was sitting alone in a
-            new country wanting to hear a familiar voice. If you&apos;re far from the people who
-            raised you, I hope it shrinks the distance for you too.
+            That&apos;s CallDad. You buy a chunk of call time, dial any phone, and pay for the
+            minutes you use. That&apos;s the whole thing. If you&apos;re away from home and want to
+            call the people there without thinking about the cost, it works for you too.
           </p>
         </div>
 
