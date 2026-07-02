@@ -22,6 +22,7 @@ import {
   ratePerMinCents,
 } from '@/lib/pricing';
 import { useTheme, type Theme } from '@/lib/use-theme';
+import { SOUNDS, renderSfx, type SfxId } from '@/lib/soundboard';
 import { buyTime, type BuyInput } from './actions/billing';
 import { signOut } from './login/actions';
 import { deleteAccount } from './actions/account';
@@ -31,7 +32,6 @@ type Contact = { id: string; name: string; phone_number: string; is_favorite?: b
 type CallRow = { to_number: string; seconds: number; created_at: string };
 type CallState = 'idle' | 'connecting' | 'live' | 'ended';
 type Quality = 'good' | 'poor';
-type OutputDevice = { id: string; label: string };
 
 type Props = {
   userId: string;
@@ -102,6 +102,75 @@ function useDtmf() {
   }, []);
 }
 
+// Soundboard: play a synthesized effect locally AND splice it into the live call
+// so the other side hears it too. We mix the caller's mic through a Web Audio
+// graph and hand the mixed track back to Twilio's outgoing sender. The call's
+// audio path is left untouched until the user actually taps a sound (a user
+// gesture), so ordinary calls carry no risk from this feature.
+function useSoundboard(getCall: () => Call | null) {
+  const ctxRef = useRef<AudioContext | null>(null);
+  const mixRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const monitorRef = useRef<GainNode | null>(null);
+  const micRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const wiredRef = useRef(false);
+
+  const ensure = useCallback(() => {
+    if (!ctxRef.current) {
+      const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const ctx = new AC();
+      const monitor = ctx.createGain();
+      monitor.gain.value = 0.45;
+      monitor.connect(ctx.destination);
+      ctxRef.current = ctx;
+      mixRef.current = ctx.createMediaStreamDestination();
+      monitorRef.current = monitor;
+      // A backgrounded tab can suspend the context; resume so the mixed mic
+      // keeps flowing to the other side when the user returns.
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && ctxRef.current?.state === 'suspended') ctxRef.current.resume().catch(() => {});
+      });
+    }
+    return ctxRef.current;
+  }, []);
+
+  const wire = useCallback((ctx: AudioContext) => {
+    if (wiredRef.current || !mixRef.current) return;
+    const call = getCall();
+    const local = call?.getLocalStream();
+    if (!call || !local || local.getAudioTracks().length === 0) return;
+    try {
+      micRef.current = ctx.createMediaStreamSource(local);
+      micRef.current.connect(mixRef.current);
+      // Internal-but-typed Twilio method: swap the outgoing track for our mix.
+      call._setInputTracksFromStream(mixRef.current.stream);
+      wiredRef.current = true;
+    } catch {
+      micRef.current?.disconnect();
+      micRef.current = null;
+    }
+  }, [getCall]);
+
+  const play = useCallback(async (id: SfxId) => {
+    const ctx = ensure();
+    try { await ctx.resume(); } catch { /* ignore */ }
+    wire(ctx);
+    const out = ctx.createGain();
+    out.gain.value = 0.9;
+    if (monitorRef.current) out.connect(monitorRef.current);
+    if (wiredRef.current && mixRef.current) out.connect(mixRef.current);
+    renderSfx(ctx, out, id);
+  }, [ensure, wire]);
+
+  // Called when a call ends: drop the old mic source so the next call re-wires.
+  const detach = useCallback(() => {
+    micRef.current?.disconnect();
+    micRef.current = null;
+    wiredRef.current = false;
+  }, []);
+
+  return { play, detach };
+}
+
 const NAV: { key: Tab; label: string }[] = [
   { key: 'keypad', label: 'Keypad' },
   { key: 'contacts', label: 'Contacts' },
@@ -136,9 +205,9 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
   const [muted, setMuted] = useState(false);
   const [quality, setQuality] = useState<Quality>('good');
   const [reconnecting, setReconnecting] = useState(false);
-  const [outputs, setOutputs] = useState<OutputDevice[]>([]);
-  const [currentOutput, setCurrentOutput] = useState('');
-  const [outputSupported, setOutputSupported] = useState(false);
+
+  const getCall = useCallback(() => callRef.current, []);
+  const { play: playSound, detach: detachSoundboard } = useSoundboard(getCall);
 
   useEffect(() => {
     if (!canCall) return;
@@ -163,21 +232,6 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
         if (cancelled) return;
         deviceRef.current = device;
         setDeviceReady(true);
-
-        const audio = device.audio;
-        if (audio?.isOutputSelectionSupported) {
-          setOutputSupported(true);
-          const refresh = () => {
-            setOutputs(
-              Array.from(audio.availableOutputDevices.entries()).map(([id, info]) => ({
-                id,
-                label: info.label || 'Output device',
-              })),
-            );
-          };
-          refresh();
-          audio.on('deviceChange', refresh);
-        }
       } catch {
         /* ignore */
       }
@@ -270,6 +324,7 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
 
       const onEnd = () => {
         stopTimer();
+        detachSoundboard();
         callRef.current = null;
         setReconnecting(false);
         setCallState('ended');
@@ -281,7 +336,7 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
       call.on('cancel', onEnd);
       call.on('reject', onEnd);
     },
-    [canCall, hasTime, loadRecents, refreshBalance],
+    [canCall, hasTime, loadRecents, refreshBalance, detachSoundboard],
   );
 
   const hangUp = useCallback(() => {
@@ -294,10 +349,6 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
     setMuted(next);
   }, [muted]);
   const sendDigit = useCallback((d: string) => { callRef.current?.sendDigits(d); }, []);
-  const setOutput = useCallback((id: string) => {
-    deviceRef.current?.audio?.speakerDevices.set(id).catch(() => {});
-    setCurrentOutput(id);
-  }, []);
 
   // Keyboard support on the keypad.
   useEffect(() => {
@@ -493,12 +544,9 @@ export function PhoneApp({ userId, email, initialBalanceSeconds, canCall, testTo
           muted={muted}
           quality={quality}
           reconnecting={reconnecting}
-          outputs={outputs}
-          currentOutput={currentOutput}
-          outputSupported={outputSupported}
-          onSetOutput={setOutput}
           onToggleMute={toggleMute}
           onSendDigit={sendDigit}
+          onPlaySound={playSound}
           onHangUp={hangUp}
         />
       )}
@@ -894,7 +942,7 @@ function QualityBars({ quality }: { quality: Quality }) {
 }
 
 function CallOverlay({
-  peer, state, seconds, muted, quality, reconnecting, outputs, currentOutput, outputSupported, onSetOutput, onToggleMute, onSendDigit, onHangUp,
+  peer, state, seconds, muted, quality, reconnecting, onToggleMute, onSendDigit, onPlaySound, onHangUp,
 }: {
   peer: { name: string; number: string };
   state: CallState;
@@ -902,15 +950,12 @@ function CallOverlay({
   muted: boolean;
   quality: Quality;
   reconnecting: boolean;
-  outputs: OutputDevice[];
-  currentOutput: string;
-  outputSupported: boolean;
-  onSetOutput: (id: string) => void;
   onToggleMute: () => void;
   onSendDigit: (d: string) => void;
+  onPlaySound: (id: SfxId) => void;
   onHangUp: () => void;
 }) {
-  const [panel, setPanel] = useState<'none' | 'keys' | 'output'>('none');
+  const [panel, setPanel] = useState<'none' | 'keys' | 'sounds'>('none');
   const live = state === 'live';
   const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#'];
   const label = reconnecting ? 'Reconnecting…' : state === 'connecting' ? 'Calling…' : live ? mmss(seconds) : 'Call ended';
@@ -936,26 +981,24 @@ function CallOverlay({
           ))}
           <button onClick={() => setPanel('none')} className="press col-span-3 mt-1 text-sm font-semibold text-white/70">Hide keypad</button>
         </div>
-      ) : panel === 'output' ? (
-        <div className="w-full max-w-[18rem] rounded-2xl bg-white/10 p-2">
-          <p className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-white/50">Audio output</p>
-          {outputs.length === 0 ? (
-            <p className="px-3 py-2 text-sm text-white/60">No devices found.</p>
-          ) : (
-            outputs.map((o) => (
-              <button key={o.id} onClick={() => { onSetOutput(o.id); setPanel('none'); }} className={`press flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm hover:bg-white/10 ${currentOutput === o.id || (!currentOutput && o.id === 'default') ? 'font-semibold text-emerald-300' : ''}`}>
-                <span className="truncate">{o.label}</span>
-                {(currentOutput === o.id) && <span>✓</span>}
+      ) : panel === 'sounds' ? (
+        <div className="w-full max-w-[20rem]">
+          <p className="mb-2 px-1 text-center text-xs text-white/50">Everyone on the call hears these</p>
+          <div className="grid grid-cols-3 gap-2.5">
+            {SOUNDS.map((s) => (
+              <button key={s.id} onClick={() => onPlaySound(s.id)} className="press flex flex-col items-center gap-1 rounded-2xl bg-white/10 py-3 transition hover:bg-white/20 active:scale-95 active:bg-white/30">
+                <span className="text-2xl leading-none">{s.emoji}</span>
+                <span className="text-[11px] font-medium text-white/80">{s.label}</span>
               </button>
-            ))
-          )}
-          <button onClick={() => setPanel('none')} className="press mt-1 w-full py-2 text-sm font-semibold text-white/70">Close</button>
+            ))}
+          </div>
+          <button onClick={() => setPanel('none')} className="press mt-3 w-full py-2 text-sm font-semibold text-white/70">Hide sounds</button>
         </div>
       ) : (
-        <div className={`grid w-full max-w-[15rem] gap-x-6 gap-y-5 ${outputSupported ? 'grid-cols-3' : 'grid-cols-2'}`}>
+        <div className="grid w-full max-w-[15rem] grid-cols-3 gap-x-6 gap-y-5">
           <CallCtl active={muted} disabled={!live} onClick={onToggleMute} label={muted ? 'Unmute' : 'Mute'} icon={<MuteIcon className="h-6 w-6" />} />
           <CallCtl disabled={!live} onClick={() => setPanel('keys')} label="Keypad" icon={<KeypadIcon className="h-6 w-6" />} />
-          {outputSupported && <CallCtl disabled={!live} onClick={() => setPanel('output')} label="Audio" icon={<SpeakerIcon className="h-6 w-6" />} />}
+          <CallCtl disabled={!live} onClick={() => setPanel('sounds')} label="Sounds" icon={<SoundsIcon className="h-6 w-6" />} />
         </div>
       )}
 
@@ -1062,8 +1105,8 @@ function GearIcon({ className }: { className?: string }) {
 function MuteIcon({ className }: { className?: string }) {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={className}><path d="M9 9v3a3 3 0 0 0 5 2.2M15 9.3V5a3 3 0 0 0-6 0v1M5 11a7 7 0 0 0 10.5 6M19 11a7 7 0 0 1-.5 2.6M12 19v3M3 3l18 18" strokeLinecap="round" strokeLinejoin="round" /></svg>;
 }
-function SpeakerIcon({ className }: { className?: string }) {
-  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={className}><path d="M4 9v6h4l5 4V5L8 9H4z" strokeLinejoin="round" /><path d="M16 9a3 3 0 0 1 0 6M18.5 7a6 6 0 0 1 0 10" strokeLinecap="round" /></svg>;
+function SoundsIcon({ className }: { className?: string }) {
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className={className}><path d="M3 14v-4M7 17V7M12 20V4M17 17V7M21 14v-4" /></svg>;
 }
 function ContactsIcon({ className }: { className?: string }) {
   return <svg viewBox="0 0 24 24" fill="currentColor" className={className}><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm0 2c-4 0-7 2-7 4.5V20h14v-1.5C19 16 16 14 12 14z" /></svg>;
